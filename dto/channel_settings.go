@@ -45,6 +45,7 @@ type ChannelOtherSettings struct {
 	DisableStore                          bool                  `json:"disable_store,omitempty"`              // 是否禁用 store 透传（默认允许透传，禁用后可能导致 Codex 无法使用）
 	AllowIncludeObfuscation               bool                  `json:"allow_include_obfuscation,omitempty"`  // 是否允许 stream_options.include_obfuscation 透传（默认过滤以避免关闭流混淆保护）
 	DisableTaskPollingSleep               bool                  `json:"disable_task_polling_sleep,omitempty"` // 是否跳过异步任务轮询间隔
+	TaskPollingConcurrency                *int                  `json:"task_polling_concurrency,omitempty"`   // 单渠道内异步任务轮询并发数（仅视频/图片类逐任务轮询生效）；<=0 或未设置时使用全局默认
 	AwsKeyType                            AwsKeyType            `json:"aws_key_type,omitempty"`
 	UpstreamModelUpdateCheckEnabled       bool                  `json:"upstream_model_update_check_enabled,omitempty"`        // 是否检测上游模型更新
 	UpstreamModelUpdateAutoSyncEnabled    bool                  `json:"upstream_model_update_auto_sync_enabled,omitempty"`    // 是否自动同步上游模型更新
@@ -60,6 +61,19 @@ func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
 		return false
 	}
 	return *s.OpenRouterEnterprise
+}
+
+// TaskPollingConcurrencyOrDefault 返回该渠道视频/图片类异步任务轮询的每渠道并发数。
+// 优先使用渠道显式配置（>0）；否则回退到传入的全局默认；两者都无效时回退到 10。
+// 返回 1 表示渠道内串行轮询。
+func (s *ChannelOtherSettings) TaskPollingConcurrencyOrDefault(globalDefault int) int {
+	if s != nil && s.TaskPollingConcurrency != nil && *s.TaskPollingConcurrency > 0 {
+		return *s.TaskPollingConcurrency
+	}
+	if globalDefault > 0 {
+		return globalDefault
+	}
+	return 10
 }
 
 const (

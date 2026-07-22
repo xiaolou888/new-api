@@ -294,6 +294,7 @@ const SENSITIVE_FORM_FIELDS = [
   'allow_speed',
   'claude_beta_query',
   'disable_task_polling_sleep',
+  'task_polling_concurrency',
   'upstream_model_update_check_enabled',
   'upstream_model_update_auto_sync_enabled',
   'upstream_model_update_ignored_models',
@@ -743,6 +744,7 @@ export function ChannelMutateDrawer({
   const currentDisableTaskPollingSleep = form.watch(
     'disable_task_polling_sleep'
   )
+  const currentTaskPollingConcurrency = form.watch('task_polling_concurrency')
   const currentProxy = form.watch('proxy')
   const currentSystemPrompt = form.watch('system_prompt')
   const currentSystemPromptOverride = form.watch('system_prompt_override')
@@ -1011,6 +1013,7 @@ export function ChannelMutateDrawer({
     currentThinkingToContent ||
     currentPassThroughBodyEnabled ||
     currentDisableTaskPollingSleep ||
+    currentTaskPollingConcurrency != null ||
     currentProxy?.trim() ||
     currentSystemPrompt?.trim() ||
     currentSystemPromptOverride
@@ -4175,6 +4178,39 @@ export function ChannelMutateDrawer({
                                 )}
                               />
                             </div>
+
+                            <FormField
+                              control={form.control}
+                              name='task_polling_concurrency'
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>
+                                    {t('Async task polling concurrency')}
+                                  </FormLabel>
+                                  <FormControl>
+                                    <Input
+                                      type='number'
+                                      min={1}
+                                      max={100}
+                                      placeholder='10'
+                                      value={field.value ?? ''}
+                                      onChange={(e) => {
+                                        const raw = e.target.value
+                                        field.onChange(
+                                          raw === '' ? undefined : Number(raw)
+                                        )
+                                      }}
+                                    />
+                                  </FormControl>
+                                  <FormDescription>
+                                    {t(
+                                      'Number of tasks polled concurrently per channel. Only applies to video/image async tasks (polled one request per task); Suno/Midjourney and non-task channels are unaffected. Set to 1 for serial polling. Default 10.'
+                                    )}
+                                  </FormDescription>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
 
                             <FormField
                               control={form.control}

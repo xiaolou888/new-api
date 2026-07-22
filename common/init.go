@@ -198,6 +198,12 @@ func initConstantEnv() {
 	constant.TaskQueryLimit = GetEnvOrDefault("TASK_QUERY_LIMIT", 1000)
 	// 异步任务超时时间（分钟），超过此时间未完成的任务将被标记为失败并退款。0 表示禁用。
 	constant.TaskTimeoutMinutes = GetEnvOrDefault("TASK_TIMEOUT_MINUTES", 1440)
+	// 视频/图片类异步任务轮询：单渠道内并发拉取数（渠道未单独配置时使用），默认 10
+	constant.TaskPollChannelConcurrency = GetEnvOrDefault("TASK_POLL_CHANNEL_CONCURRENCY", 10)
+	// 视频/图片类异步任务轮询：全局并发上限，跨所有渠道共享，防止打爆上游/DB，默认 50
+	constant.TaskPollGlobalConcurrency = GetEnvOrDefault("TASK_POLL_GLOBAL_CONCURRENCY", 50)
+	// 单次上游任务查询（FetchTask）超时时间（秒），默认 30，避免卡住的请求长期占用并发额度。<=0 表示禁用超时。
+	constant.TaskPollFetchTimeoutSeconds = GetEnvOrDefault("TASK_POLL_FETCH_TIMEOUT_SECONDS", 30)
 
 	soraPatchStr := GetEnvOrDefaultString("TASK_PRICE_PATCH", "")
 	if soraPatchStr != "" {

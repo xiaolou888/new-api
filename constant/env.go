@@ -19,6 +19,15 @@ var ErrorLogEnabled bool
 var TaskQueryLimit int
 var TaskTimeoutMinutes int
 
+// Async task polling throughput controls (video/image style per-task polling).
+// TaskPollChannelConcurrency is the default number of concurrent upstream fetches
+// per channel when the channel does not override it. TaskPollGlobalConcurrency
+// caps total concurrent upstream fetches across all channels. TaskPollFetchTimeoutSeconds
+// bounds a single FetchTask call.
+var TaskPollChannelConcurrency int
+var TaskPollGlobalConcurrency int
+var TaskPollFetchTimeoutSeconds int
+
 // temporary variable for sora patch, will be removed in future
 var TaskPricePatches []string
 

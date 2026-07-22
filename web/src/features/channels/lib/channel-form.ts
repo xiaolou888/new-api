@@ -241,6 +241,7 @@ export const channelFormSchema = z
     allow_speed: z.boolean().optional(), // Anthropic: speed mode control
     claude_beta_query: z.boolean().optional(), // Anthropic: beta query passthrough
     disable_task_polling_sleep: z.boolean().optional(),
+    task_polling_concurrency: z.number().int().min(1).max(100).optional(), // Video/image async task per-channel polling concurrency
     // Upstream model update settings (stored in settings JSON)
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
@@ -391,6 +392,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   allow_speed: false,
   claude_beta_query: false,
   disable_task_polling_sleep: false,
+  task_polling_concurrency: undefined,
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
@@ -447,6 +449,7 @@ export function transformChannelToFormDefaults(
   let allowSpeed = false
   let claudeBetaQuery = false
   let disableTaskPollingSleep = false
+  let taskPollingConcurrency: number | undefined
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
@@ -467,6 +470,13 @@ export function transformChannelToFormDefaults(
       allowSpeed = parsed.allow_speed === true
       claudeBetaQuery = parsed.claude_beta_query === true
       disableTaskPollingSleep = parsed.disable_task_polling_sleep === true
+      if (
+        typeof parsed.task_polling_concurrency === 'number' &&
+        Number.isFinite(parsed.task_polling_concurrency) &&
+        parsed.task_polling_concurrency > 0
+      ) {
+        taskPollingConcurrency = parsed.task_polling_concurrency
+      }
       upstreamModelUpdateCheckEnabled =
         parsed.upstream_model_update_check_enabled === true
       upstreamModelUpdateAutoSyncEnabled =
@@ -525,6 +535,7 @@ export function transformChannelToFormDefaults(
     allow_speed: allowSpeed,
     claude_beta_query: claudeBetaQuery,
     disable_task_polling_sleep: disableTaskPollingSleep,
+    task_polling_concurrency: taskPollingConcurrency,
     allow_safety_identifier: allowSafetyIdentifier,
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
@@ -639,6 +650,20 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
 
   settingsObj.disable_task_polling_sleep =
     formData.disable_task_polling_sleep === true
+
+  // Per-channel async task polling concurrency: persist only when a valid value
+  // is provided; otherwise fall back to the global default at runtime.
+  if (
+    typeof formData.task_polling_concurrency === 'number' &&
+    Number.isFinite(formData.task_polling_concurrency) &&
+    formData.task_polling_concurrency >= 1
+  ) {
+    settingsObj.task_polling_concurrency = Math.floor(
+      formData.task_polling_concurrency
+    )
+  } else if ('task_polling_concurrency' in settingsObj) {
+    delete settingsObj.task_polling_concurrency
+  }
 
   // Upstream model update settings (for model-fetchable channel types)
   if (MODEL_FETCHABLE_TYPES.has(formData.type)) {

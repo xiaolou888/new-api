@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,41 @@ const (
 	refundReconciliationGracePeriod = 30 * time.Second
 )
 
+// patchDataStatus 将 task.Data（上游原始 JSON 响应）中的顶层 "status" 字段覆写为给定
+// 终态，使被强制置为失败（超时清理 / 无法获取渠道 / 空 upstream id）的任务在“列状态”
+// 与“Data 内嵌状态”之间保持一致。见 issue #5715：仅更新列状态会导致下游 TaskModel2Dto /
+// ConvertToOpenAIVideo 读取 Data 时状态矛盾（列为 FAILURE，data.status 仍为 IN_PROGRESS）。
+//
+// 仅当 Data 为含 "status" 键的 JSON 对象时改写；Data 为空、非 JSON 对象或不含 status 字段时
+// 原样返回并报告未改写（changed=false），不破坏既有数据。使用 map[string]json.RawMessage
+// 保留其余字段的原始字节，避免经由 interface{} 解码导致数值精度丢失。
+//
+// 注意：本函数只处理顶层 status。个别渠道适配器（如 ali 的 output.task_status）将状态存放
+// 在嵌套路径，此处不做逐渠道特殊处理（与官方 PR #5769 一致），这类渠道的 Data 内嵌状态仍以
+// 下一轮正常轮询覆盖为准。
+func patchDataStatus(data json.RawMessage, status model.TaskStatus) (json.RawMessage, bool) {
+	if len(data) == 0 {
+		return data, false
+	}
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(data, &fields); err != nil {
+		return data, false
+	}
+	if _, ok := fields["status"]; !ok {
+		return data, false
+	}
+	statusBytes, err := common.Marshal(string(status))
+	if err != nil {
+		return data, false
+	}
+	fields["status"] = statusBytes
+	patched, err := common.Marshal(fields)
+	if err != nil {
+		return data, false
+	}
+	return patched, true
+}
+
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
 // 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
@@ -73,6 +109,10 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.Quota = 0
 		} else {
 			task.FailReason = reason
+		}
+		// 同步 Data 内嵌状态，避免列状态与 data.status 矛盾（issue #5715）。
+		if patched, ok := patchDataStatus(task.Data, model.TaskStatusFailure); ok {
+			task.Data = patched
 		}
 
 		won, err := task.UpdateWithStatus(oldStatus)
@@ -181,11 +221,13 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskChannelM := make(map[int][]string)
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
+		nullTasks := make([]*model.Task, 0)
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
+				nullTasks = append(nullTasks, task)
 				continue
 			}
 			taskM[upstreamID] = task
@@ -201,6 +243,14 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 				logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
 			} else {
 				logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", nullTaskIds))
+			}
+			// 同步 Data 内嵌状态（issue #5715）：仅对含顶层 status 的行追加单行写入。
+			for _, task := range nullTasks {
+				if patched, ok := patchDataStatus(task.Data, model.TaskStatusFailure); ok {
+					if e := model.TaskBulkUpdateByID([]int64{task.ID}, map[string]any{"data": patched}); e != nil {
+						logger.LogError(ctx, fmt.Sprintf("Fix null task_id data status error for task %d: %v", task.ID, e))
+					}
+				}
 			}
 		}
 		if len(taskChannelM) == 0 {
@@ -272,6 +322,18 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		})
 		if err != nil {
 			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
+		}
+		// 同步 Data 内嵌状态（issue #5715）。
+		for _, upstreamID := range taskIds {
+			t, ok := taskM[upstreamID]
+			if !ok {
+				continue
+			}
+			if patched, changed := patchDataStatus(t.Data, model.TaskStatusFailure); changed {
+				if e := model.TaskBulkUpdateByID([]int64{t.ID}, map[string]any{"data": patched}); e != nil {
+					common.SysLog(fmt.Sprintf("UpdateSunoTask data status error for task %d: %v", t.ID, e))
+				}
+			}
 		}
 		return err
 	}
@@ -389,13 +451,21 @@ func taskNeedsUpdate(oldTask *model.Task, newTask dto.SunoDataResponse) bool {
 	return false
 }
 
-// UpdateVideoTasks 按渠道更新所有视频任务
+// UpdateVideoTasks 按渠道更新所有视频任务。渠道之间并发（一个 goroutine 一个渠道），
+// 渠道内部的并发度由 updateVideoTasks 决定。globalSem 跨所有渠道共享，限制同时进行的
+// 上游 FetchTask 总数，避免"渠道数 × 每渠道并发"打爆上游或数据库连接。
 func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
 	channelIDs := make([]int, 0, len(taskChannelM))
 	for channelID := range taskChannelM {
 		channelIDs = append(channelIDs, channelID)
 	}
 	sort.Ints(channelIDs)
+
+	globalConcurrency := constant.TaskPollGlobalConcurrency
+	if globalConcurrency <= 0 {
+		globalConcurrency = 50
+	}
+	globalSem := make(chan struct{}, globalConcurrency)
 
 	var wg sync.WaitGroup
 	for _, channelId := range channelIDs {
@@ -408,7 +478,7 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 		wg.Add(1)
 		gopool.Go(func() {
 			defer wg.Done()
-			if err := updateVideoTasks(ctx, platform, channelId, taskIds, taskM); err != nil {
+			if err := updateVideoTasks(ctx, platform, channelId, taskIds, taskM, globalSem); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("Channel #%d failed to update video async tasks: %s", channelId, err.Error()))
 			}
 		})
@@ -420,7 +490,7 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 	return nil
 }
 
-func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, channelId int, taskIds []string, taskM map[string]*model.Task) error {
+func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, channelId int, taskIds []string, taskM map[string]*model.Task, globalSem chan struct{}) error {
 	logger.LogInfo(ctx, fmt.Sprintf("Channel #%d pending video tasks: %d", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -445,38 +515,115 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		if errUpdate != nil {
 			common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
 		}
+		// 同步 Data 内嵌状态（issue #5715）。
+		for _, upstreamID := range taskIds {
+			t, ok := taskM[upstreamID]
+			if !ok {
+				continue
+			}
+			if patched, changed := patchDataStatus(t.Data, model.TaskStatusFailure); changed {
+				if e := model.TaskBulkUpdateByID([]int64{t.ID}, map[string]any{"data": patched}); e != nil {
+					common.SysLog(fmt.Sprintf("UpdateVideoTask data status error for task %d: %v", t.ID, e))
+				}
+			}
+		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
+	}
+	if GetTaskAdaptorFunc(platform) == nil {
+		return fmt.Errorf("video adaptor not found")
+	}
+
+	otherSettings := cacheGetChannel.GetOtherSettings()
+	concurrency := otherSettings.TaskPollingConcurrencyOrDefault(constant.TaskPollChannelConcurrency)
+
+	// 并发度 <= 1：串行回退，保留旧的每任务 1 秒间隔（限速渠道可依赖此节流；
+	// 也可用 disable_task_polling_sleep 关闭）。
+	if concurrency <= 1 {
+		disablePollingSleep := otherSettings.DisableTaskPollingSleep
+		for i, taskId := range taskIds {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			pollVideoTask(ctx, platform, cacheGetChannel, taskId, taskM, globalSem)
+			if disablePollingSleep || i == len(taskIds)-1 {
+				continue
+			}
+			// sleep 1 second between tasks for this channel only.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
+		}
+		return nil
+	}
+
+	// 并发度 > 1：渠道内用有界 worker 池并发拉取，不再逐任务 sleep。
+	// 任务状态写入走 CAS (UpdateWithStatus)，并发更新不会重复退款/覆盖终态。
+	channelSem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, taskId := range taskIds {
+		if ctx.Err() != nil {
+			break
+		}
+		channelSem <- struct{}{}
+		taskId := taskId
+		wg.Add(1)
+		gopool.Go(func() {
+			defer wg.Done()
+			defer func() { <-channelSem }()
+			pollVideoTask(ctx, platform, cacheGetChannel, taskId, taskM, globalSem)
+		})
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// pollVideoTask 拉取并更新单个视频任务。每次调用使用独立的 adaptor 实例，保证并发安全；
+// 通过 globalSem 限制全局并发的上游请求数，并对单次拉取施加超时，避免个别卡住的上游
+// 请求长期占用并发额度（超时后放弃等待，任务保持未完成、下一轮重试）。
+func pollVideoTask(ctx context.Context, platform constant.TaskPlatform, ch *model.Channel, taskId string, taskM map[string]*model.Task, globalSem chan struct{}) {
+	if ctx.Err() != nil {
+		return
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
 	if adaptor == nil {
-		return fmt.Errorf("video adaptor not found")
+		return
 	}
 	info := &relaycommon.RelayInfo{}
 	info.ChannelMeta = &relaycommon.ChannelMeta{
-		ChannelBaseUrl: cacheGetChannel.GetBaseURL(),
+		ChannelBaseUrl: ch.GetBaseURL(),
 	}
-	info.ApiKey = cacheGetChannel.Key
+	info.ApiKey = ch.Key
 	adaptor.Init(info)
-	disablePollingSleep := cacheGetChannel.GetOtherSettings().DisableTaskPollingSleep
-	for i, taskId := range taskIds {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
+
+	globalSem <- struct{}{}
+	defer func() { <-globalSem }()
+
+	timeout := time.Duration(constant.TaskPollFetchTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		if err := updateVideoSingleTask(ctx, adaptor, ch, taskId, taskM); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
 		}
-		if disablePollingSleep || i == len(taskIds)-1 {
-			continue
-		}
-
-		// sleep 1 second between tasks for this channel only.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(1 * time.Second):
-		}
+		return
 	}
-	return nil
+
+	done := make(chan error, 1)
+	gopool.Go(func() {
+		done <- updateVideoSingleTask(ctx, adaptor, ch, taskId, taskM)
+	})
+	select {
+	case err := <-done:
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
+		}
+	case <-time.After(timeout):
+		logger.LogWarn(ctx, fmt.Sprintf("video task %s poll exceeded %s, abandoning wait; will retry next pass", taskId, timeout))
+	case <-ctx.Done():
+	}
 }
 
 func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, taskId string, taskM map[string]*model.Task) error {
